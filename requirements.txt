@@ -1,4 +1,15 @@
+# Core
 fastapi
-uvicorn
-supabase-py
+uvicorn[standard]
 python-dotenv
+pydantic>=2.0
+
+# Database
+supabase
+
+# AI
+google-generativeai
+chromadb
+
+# WebSocket support (included via uvicorn[standard])
+websockets
