@@ -41,7 +41,8 @@ async def register(user: UserRegister):
 
     # Prepare payload
     payload = {
-        "full_name": user.full_name,
+        "first_name": user.first_name,
+        "last_name": user.last_name,
         "password_hash": hashed_password,
         "role": user.role,
         "avatar_color": generate_random_color(),

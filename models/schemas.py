@@ -83,7 +83,8 @@ class PlayerRole(str, Enum):
 # ─── Player / User Models ────────────────────────────────────────────────────
 
 class UserRegister(BaseModel):
-    full_name: str = Field(..., min_length=1, max_length=100)
+    first_name: str = Field(..., min_length=1, max_length=50)
+    last_name: str = Field(..., min_length=1, max_length=50)
     email: Optional[str] = Field(None, max_length=255)
     phone: Optional[str] = Field(None, max_length=15)
     password: str = Field(..., min_length=6)
@@ -95,7 +96,8 @@ class UserLogin(BaseModel):
 
 class AuthUserResponse(BaseModel):
     id: str
-    full_name: str
+    first_name: str
+    last_name: str
     email: Optional[str] = None
     phone: Optional[str] = None
     avatar_color: Optional[str] = None
