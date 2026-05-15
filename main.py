@@ -12,6 +12,7 @@ from routes.matches import router as matches_router
 from routes.players import router as players_router
 from routes.chat import router as chat_router
 from routes.auth import router as auth_router
+from routes.teams import router as teams_router
 
 # ─── App Initialisation ──────────────────────────────────────────────────────
 
@@ -43,6 +44,7 @@ app.add_middleware(
 app.include_router(auth_router, prefix="/api")
 app.include_router(matches_router, prefix="/api")
 app.include_router(players_router, prefix="/api")
+app.include_router(teams_router, prefix="/api")
 app.include_router(chat_router, prefix="/api")
 
 

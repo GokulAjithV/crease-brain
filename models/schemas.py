@@ -149,13 +149,19 @@ class PlayerResponse(BaseModel):
 
 class TeamCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
-    logo_url: Optional[str] = None
-
+    city: Optional[str] = None
+    avatar_color: Optional[str] = None
+    captain_can_edit: bool = False
 
 class TeamPlayerAdd(BaseModel):
-    player_id: str
+    player_id: Optional[str] = None
+    guest_name: Optional[str] = None
+    guest_phone: Optional[str] = None
     is_captain: bool = False
     is_vice_captain: bool = False
+    role: Optional[str] = "BAT"
+    batting_style: Optional[str] = "RHB"
+    bowling_style: Optional[str] = None
 
 
 # ─── Match Models ─────────────────────────────────────────────────────────────
