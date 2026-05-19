@@ -2,11 +2,14 @@
 Authentication routes for register and login.
 """
 
+import logging
 from fastapi import APIRouter, HTTPException, status
 from models.schemas import UserRegister, UserLogin, Token, AuthUserResponse
 from services.db import supabase
 from services.auth import get_password_hash, verify_password, create_access_token
 import random
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -16,7 +19,11 @@ def generate_random_color() -> str:
 
 @router.post("/register", response_model=Token, status_code=status.HTTP_201_CREATED)
 async def register(user: UserRegister):
+    identifier = user.email or user.phone
+    logger.info("Registration attempt for: %s", identifier)
+    
     if not user.email and not user.phone:
+        logger.warning("Registration failed: neither email nor phone provided.")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Either email or phone must be provided."
@@ -31,6 +38,7 @@ async def register(user: UserRegister):
         
     existing_user = query.execute()
     if existing_user.data:
+        logger.warning("Registration failed: user with email/phone %s already exists.", identifier)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="A user with this email or phone already exists."
@@ -57,6 +65,7 @@ async def register(user: UserRegister):
     response = supabase.table("users").insert(payload).execute()
     
     if not response.data:
+        logger.error("Database insert failed during registration for %s", identifier)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to register user."
@@ -64,6 +73,7 @@ async def register(user: UserRegister):
 
     new_user = response.data[0]
     if not isinstance(new_user, dict):
+        logger.error("Unexpected database response format during registration")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Unexpected response format from database."
@@ -74,15 +84,18 @@ async def register(user: UserRegister):
     # Generate JWT
     access_token = create_access_token(data={"sub": new_user["id"], "role": new_user["role"]})
 
+    logger.info("Successfully registered user %s", new_user["id"])
     return Token(access_token=access_token, user=user_response)
 
 @router.post("/login", response_model=Token)
 async def login(credentials: UserLogin):
+    logger.info("Login attempt for: %s", credentials.email_or_phone)
     # Find user by email or phone
     # We will try both fields.
     query = supabase.table("users").select("*").or_(f"email.eq.{credentials.email_or_phone},phone.eq.{credentials.email_or_phone}").limit(1).execute()
     
     if not query.data:
+        logger.warning("Login failed: User not found for %s", credentials.email_or_phone)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials.",
@@ -91,6 +104,7 @@ async def login(credentials: UserLogin):
         
     user_data = query.data[0]
     if not isinstance(user_data, dict):
+        logger.error("Unexpected database response format during login")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Unexpected response format from database."
@@ -98,6 +112,7 @@ async def login(credentials: UserLogin):
     
     # Verify active
     if not user_data.get("is_active", True):
+        logger.warning("Login failed: Account disabled for user %s", user_data.get("id"))
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Account is disabled."
@@ -105,6 +120,7 @@ async def login(credentials: UserLogin):
         
     # Verify password
     if not verify_password(credentials.password, str(user_data["password_hash"])):
+        logger.warning("Login failed: Incorrect password for user %s", user_data.get("id"))
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials.",
@@ -116,4 +132,5 @@ async def login(credentials: UserLogin):
     # Generate JWT
     access_token = create_access_token(data={"sub": user_data["id"], "role": user_data["role"]})
 
+    logger.info("User %s logged in successfully", user_data["id"])
     return Token(access_token=access_token, user=user_response)

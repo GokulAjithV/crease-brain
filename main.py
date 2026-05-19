@@ -5,8 +5,15 @@ Initialises the app, configures CORS for the crease-lens frontend,
 and registers all route modules.
 """
 
+import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+# Configure basic logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 
 from routes.matches import router as matches_router
 from routes.players import router as players_router
