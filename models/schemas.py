@@ -17,18 +17,21 @@ from pydantic import BaseModel, Field, field_validator
 
 # ─── Enums ────────────────────────────────────────────────────────────────────
 
-class MatchFormat(str, Enum):
-    LIMITED_OVERS = "limited_overs"
-    BOX_TURF = "box_turf"
-    PAIR_CRICKET = "pair_cricket"
-    TEST = "test"
-    THE_HUNDRED = "the_hundred"
+class MatchType(str, Enum):
+    T20 = "T20"
+    ODI = "ODI"
+    TEST = "Test"
+    LIMITED = "Limited"
+    BOX = "Box"
+    PAIR = "Pair"
+    THE_HUNDRED = "TheHundred"
 
 
 class MatchStatus(str, Enum):
-    SCHEDULED = "scheduled"
+    SETUP = "setup"
     TOSS = "toss"
-    LIVE = "live"
+    PLAYING = "playing"
+    INNINGS_BREAK = "innings_break"
     COMPLETED = "completed"
     ABANDONED = "abandoned"
 
@@ -167,45 +170,49 @@ class TeamPlayerAdd(BaseModel):
 # ─── Match Models ─────────────────────────────────────────────────────────────
 
 class MatchCreate(BaseModel):
-    """Create a new match."""
-    team_a: str = Field(..., description="Team A identifier (team id or name)")
-    team_b: str = Field(..., description="Team B identifier (team id or name)")
-    format: MatchFormat = MatchFormat.LIMITED_OVERS
-    overs: int = Field(20, ge=1, le=100, description="Total overs per side")
-    overs_per_bowler: Optional[int] = Field(None, ge=1, description="Max overs per bowler")
-    powerplay_overs: Optional[int] = Field(None, ge=0)
+    """Create a new match — aligned with Supabase matches table."""
+    team_a_id: str = Field(..., description="Team A UUID")
+    team_b_id: str = Field(..., description="Team B UUID")
+    match_type: MatchType = MatchType.T20
+    total_overs: int = Field(20, ge=1, le=100, description="Total overs per side")
+    overs_per_bowler: int = Field(4, ge=1, description="Max overs per bowler")
     city: Optional[str] = Field(None, max_length=100)
-    ground: Optional[str] = Field(None, max_length=200)
+    venue: Optional[str] = Field(None, max_length=200)
     scheduled_at: Optional[datetime] = None
+    ball_type: Optional[str] = Field("tennis", description="leather, tennis, other")
+    pitch_type: Optional[str] = Field("rough", description="turf, rough, cement, astroturf, matting")
 
     @field_validator("overs_per_bowler")
     @classmethod
-    def validate_overs_per_bowler(cls, v: Optional[int], info) -> Optional[int]:
-        if v is not None and "overs" in info.data and v > info.data["overs"]:
-            raise ValueError("overs_per_bowler cannot exceed total overs")
+    def validate_overs_per_bowler(cls, v: int, info) -> int:
+        if "total_overs" in info.data and v > info.data["total_overs"]:
+            raise ValueError("overs_per_bowler cannot exceed total_overs")
         return v
 
 
 class MatchResponse(BaseModel):
     id: str
-    team_a: str
-    team_b: str
-    format: str
+    team_a_id: str
+    team_b_id: str
+    match_type: str
     status: str
-    overs: Optional[int] = None
+    total_overs: int
+    overs_per_bowler: int
     city: Optional[str] = None
-    ground: Optional[str] = None
-    toss_winner: Optional[str] = None
-    toss_decision: Optional[str] = None
-    winner: Optional[str] = None
+    venue: Optional[str] = None
+    ball_type: Optional[str] = None
+    pitch_type: Optional[str] = None
+    toss_winner_id: Optional[str] = None
+    toss_election: Optional[str] = None
+    created_by: Optional[str] = None
     created_at: Optional[str] = None
 
 
 # ─── Toss ─────────────────────────────────────────────────────────────────────
 
 class TossRecord(BaseModel):
-    toss_winner: str = Field(..., description="Team id that won the toss")
-    toss_decision: str = Field(..., pattern="^(bat|bowl)$", description="Elected to bat or bowl")
+    toss_winner_id: str = Field(..., description="Team id that won the toss")
+    toss_election: str = Field(..., pattern="^(bat|bowl)$", description="Elected to bat or bowl")
 
 
 # ─── Innings Models ──────────────────────────────────────────────────────────
