@@ -5,7 +5,7 @@ Handles match creation, toss, innings start, ball-by-ball recording,
 scorecard retrieval, and live WebSocket updates.
 """
 
-from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from typing import List, cast
 
 from models.schemas import (
@@ -20,6 +20,7 @@ from models.schemas import (
 )
 from services.db import supabase
 from services.websocket import manager
+from services.auth import get_current_user
 
 router = APIRouter(prefix="/matches", tags=["matches"])
 
@@ -104,23 +105,26 @@ async def _build_scorecard(match_id: str) -> dict | None:
 # ─── Match CRUD ───────────────────────────────────────────────────────────────
 
 @router.post("/", response_model=APIResponse)
-async def create_match(match: MatchCreate):
+async def create_match(match: MatchCreate, user: dict = Depends(get_current_user)):
     """Create a new match."""
+    user_id = user.get("sub")
     payload = {
-        "team_a": match.team_a,
-        "team_b": match.team_b,
-        "format": match.format.value,
-        "overs": match.overs,
-        "status": "scheduled",
+        "team_a_id": match.team_a_id,
+        "team_b_id": match.team_b_id,
+        "match_type": match.match_type.value,
+        "total_overs": match.total_overs,
+        "overs_per_bowler": match.overs_per_bowler,
+        "status": "setup",
+        "created_by": user_id,
     }
-    if match.overs_per_bowler:
-        payload["overs_per_bowler"] = match.overs_per_bowler
-    if match.powerplay_overs is not None:
-        payload["powerplay_overs"] = match.powerplay_overs
     if match.city:
         payload["city"] = match.city
-    if match.ground:
-        payload["ground"] = match.ground
+    if match.venue:
+        payload["venue"] = match.venue
+    if match.ball_type:
+        payload["ball_type"] = match.ball_type
+    if match.pitch_type:
+        payload["pitch_type"] = match.pitch_type
     if match.scheduled_at:
         payload["scheduled_at"] = match.scheduled_at.isoformat()
 
@@ -129,7 +133,7 @@ async def create_match(match: MatchCreate):
     if not response.data:
         raise HTTPException(status_code=400, detail="Failed to create match")
 
-    return APIResponse(message="Match created", data=response.data)
+    return APIResponse(message="Match created", data=response.data[0])
 
 
 @router.get("/", response_model=APIResponse)
@@ -159,8 +163,8 @@ async def record_toss(match_id: str, toss: TossRecord):
     response = (
         supabase.table("matches")
         .update({
-            "toss_winner": toss.toss_winner,
-            "toss_decision": toss.toss_decision,
+            "toss_winner_id": toss.toss_winner_id,
+            "toss_election": toss.toss_election,
             "status": "toss",
         })
         .eq("id", match_id)
@@ -168,7 +172,7 @@ async def record_toss(match_id: str, toss: TossRecord):
     )
     if not response.data:
         raise HTTPException(status_code=400, detail="Failed to record toss")
-    return APIResponse(message="Toss recorded", data=response.data)
+    return APIResponse(message="Toss recorded", data=response.data[0])
 
 
 # ─── Innings ──────────────────────────────────────────────────────────────────
@@ -187,8 +191,8 @@ async def start_innings(match_id: str, innings: InningsCreate):
     if not response.data:
         raise HTTPException(status_code=400, detail="Failed to start innings")
 
-    # Update match status to live
-    supabase.table("matches").update({"status": "live"}).eq("id", match_id).execute()
+    # Update match status to playing
+    supabase.table("matches").update({"status": "playing"}).eq("id", match_id).execute()
 
     return APIResponse(message="Innings started", data=response.data)
 

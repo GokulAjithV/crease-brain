@@ -36,13 +36,29 @@ async def create_team(team: TeamCreate, user: dict = Depends(get_current_user)):
     return APIResponse(message="Team created successfully", data=response.data[0])
 
 @router.get("", response_model=APIResponse)
-async def list_teams(user: dict = Depends(get_current_user)):
-    # Get teams created by the user or where the user is a player
-    # For now, just returning teams created by the user
+async def list_teams(scope: str | None = None, user: dict = Depends(get_current_user)):
+    """
+    List teams.
+
+    Args:
+        scope: 'all' to return every team, otherwise only the current user's teams.
+    """
     user_id = user.get("sub")
-    logger.info("Fetching teams for user %s", user_id)
-    response = supabase.table("teams").select("*").eq("created_by", user_id).execute()
-    return APIResponse(message="Teams retrieved", data=response.data or [])
+    logger.info("Fetching teams for user %s (scope=%s)", user_id, scope)
+
+    if scope == "all":
+        response = supabase.table("teams").select("*, team_players(count)").order("name").execute()
+    else:
+        response = supabase.table("teams").select("*, team_players(count)").eq("created_by", user_id).order("name").execute()
+
+    # Flatten the player_count from the nested team_players aggregate
+    teams = []
+    for team in (response.data or []):
+        tp = team.pop("team_players", [])
+        team["player_count"] = tp[0]["count"] if tp else 0
+        teams.append(team)
+
+    return APIResponse(message="Teams retrieved", data=teams)
 
 @router.post("/{team_id}/players", response_model=APIResponse, status_code=status.HTTP_201_CREATED)
 async def add_player_to_team(team_id: str, player: TeamPlayerAdd, user: dict = Depends(get_current_user)):
