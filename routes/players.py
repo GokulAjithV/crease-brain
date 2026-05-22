@@ -5,7 +5,8 @@ Handles player CRUD, profile retrieval, per-player career stats,
 and match history lookups.
 """
 
-from fastapi import APIRouter, HTTPException
+import logging
+from fastapi import APIRouter, HTTPException, Depends
 from typing import cast
 
 from models.schemas import (
@@ -16,6 +17,9 @@ from models.schemas import (
     PlayerMatchStats,
 )
 from services.db import supabase
+from services.auth import get_current_user
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/players", tags=["players"])
 
@@ -57,6 +61,27 @@ async def list_players(team_id: str | None = None, limit: int = 50):
         query = query.eq("team_id", team_id)
     response = query.execute()
     return APIResponse(message="Players fetched", data=response.data)
+
+
+@router.get("/search", response_model=APIResponse)
+async def search_by_phone(phone: str, user: dict = Depends(get_current_user)):
+    """Search for a registered user by phone number."""
+    logger.info("Searching user by phone: %s", phone)
+    
+    cleaned = "".join([c for c in phone if c.isdigit() or c == "+"])
+    
+    query = supabase.table("users").select("id, first_name, last_name, phone, role, avatar_color").eq("phone", cleaned).execute()
+    
+    if not query.data and len(cleaned) == 10 and cleaned.isdigit():
+        query = supabase.table("users").select("id, first_name, last_name, phone, role, avatar_color").eq("phone", f"+91{cleaned}").execute()
+        
+    if not query.data and cleaned.startswith("+91") and len(cleaned) > 3:
+        query = supabase.table("users").select("id, first_name, last_name, phone, role, avatar_color").eq("phone", cleaned[3:]).execute()
+        
+    if not query.data:
+        return APIResponse(message="No player found with this phone number", data=None)
+        
+    return APIResponse(message="Player found", data=query.data[0])
 
 
 @router.get("/{player_id}", response_model=APIResponse)
