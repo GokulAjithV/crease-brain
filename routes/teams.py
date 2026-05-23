@@ -207,18 +207,18 @@ async def generate_invite(team_id: str, user: dict = Depends(get_current_user)):
     token = team.get("invite_token")
     expires_at_str = team.get("invite_expires_at")
     
-    is_valid = False
+    expires_at = None
     if token and expires_at_str:
         try:
-            expires_at = datetime.fromisoformat(expires_at_str)
-            if expires_at.tzinfo is None:
-                expires_at = expires_at.replace(tzinfo=timezone.utc)
-            if expires_at > datetime.now(timezone.utc):
-                is_valid = True
+            parsed_expires_at = datetime.fromisoformat(expires_at_str)
+            if parsed_expires_at.tzinfo is None:
+                parsed_expires_at = parsed_expires_at.replace(tzinfo=timezone.utc)
+            if parsed_expires_at > datetime.now(timezone.utc):
+                expires_at = parsed_expires_at
         except Exception:
             pass
             
-    if not is_valid:
+    if expires_at is None:
         token = secrets.token_urlsafe(16)
         expires_at = datetime.now(timezone.utc) + timedelta(days=7)
         
@@ -238,7 +238,7 @@ async def generate_invite(team_id: str, user: dict = Depends(get_current_user)):
         message="Invite token retrieved",
         data={
             "invite_token": token,
-            "invite_expires_at": expires_at_str if is_valid else expires_at.isoformat()
+            "invite_expires_at": expires_at.isoformat()
         }
     )
 

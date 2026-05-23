@@ -12,6 +12,7 @@ from models.schemas import (
     MatchCreate,
     MatchResponse,
     TossRecord,
+    SquadSubmit,
     InningsCreate,
     InningsResponse,
     BallEventCreate,
@@ -28,7 +29,7 @@ router = APIRouter(prefix="/matches", tags=["matches"])
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 async def _build_scorecard(match_id: str) -> dict | None:
-    """Compute a live scorecard from innings + deliveries tables."""
+    """Compute a live scorecard from innings + overs tables."""
     innings_res = (
         supabase.table("innings")
         .select("*")
@@ -37,66 +38,42 @@ async def _build_scorecard(match_id: str) -> dict | None:
         .execute()
     )
 
-    innings_data = cast(list[dict], innings_res.data or [])
+    innings_data = innings_res.data or []
     if not innings_data:
         return None
 
-    scorecard: list[dict] = []
-
+    scorecard = []
     for inn in innings_data:
         innings_id = inn["id"]
-        deliveries_res = (
-            supabase.table("deliveries")
+        # Fetch overs to see bowlers performance
+        overs_res = (
+            supabase.table("overs")
             .select("*")
             .eq("innings_id", innings_id)
             .execute()
         )
-        deliveries = cast(list[dict], deliveries_res.data or [])
+        overs_data = overs_res.data or []
 
-        total_runs = sum(d["runs"] + d.get("extras", 0) for d in deliveries)
-        total_wickets = sum(1 for d in deliveries if d.get("is_wicket"))
-
-        legal_balls = sum(
-            1 for d in deliveries
-            if d.get("extra_type") not in ("wide", "no_ball")
-        )
-        overs = f"{legal_balls // 6}.{legal_balls % 6}"
-
-        # Batsman aggregations
-        batsmen: dict[str, dict] = {}
-        for d in deliveries:
-            bid = d["batsman_id"]
-            if bid not in batsmen:
-                batsmen[bid] = {"runs": 0, "balls": 0, "fours": 0, "sixes": 0}
-            batsmen[bid]["runs"] += d["runs"]
-            if d.get("runs") == 4 and d.get("is_boundary", False):
-                batsmen[bid]["fours"] += 1
-            if d.get("runs") == 6 or d.get("is_six", False):
-                batsmen[bid]["sixes"] += 1
-            if d.get("extra_type") != "wide":
-                batsmen[bid]["balls"] += 1
-
-        # Bowler aggregations
-        bowlers: dict[str, dict] = {}
-        for d in deliveries:
-            brid = d["bowler_id"]
+        # Bowler aggregations from overs
+        bowlers = {}
+        for o in overs_data:
+            brid = o["bowler_id"]
             if brid not in bowlers:
-                bowlers[brid] = {"runs": 0, "wickets": 0, "balls": 0}
-            bowlers[brid]["runs"] += d["runs"] + d.get("extras", 0)
-            if d.get("is_wicket"):
-                bowlers[brid]["wickets"] += 1
-            if d.get("extra_type") not in ("wide", "no_ball"):
-                bowlers[brid]["balls"] += 1
+                bowlers[brid] = {"runs": 0, "wickets": 0, "overs": 0}
+            bowlers[brid]["runs"] += o.get("runs") or 0
+            bowlers[brid]["wickets"] += o.get("wickets") or 0
+            bowlers[brid]["overs"] += 1
 
         scorecard.append({
             "innings_id": innings_id,
-            "batting_team": inn["batting_team"],
+            "batting_team_id": inn["batting_team_id"],
+            "bowling_team_id": inn["bowling_team_id"],
             "innings_number": inn.get("innings_number", 1),
-            "total_runs": total_runs,
-            "total_wickets": total_wickets,
-            "overs": overs,
-            "batsmen": batsmen,
+            "total_runs": inn.get("total_runs") or 0,
+            "total_wickets": inn.get("total_wickets") or 0,
+            "overs": str(inn.get("overs_played") or "0.0"),
             "bowlers": bowlers,
+            "batsmen": {} # No deliveries table, returning empty dict
         })
 
     return {"match_id": match_id, "scorecard": scorecard}
@@ -146,13 +123,166 @@ async def list_matches(status: str | None = None, limit: int = 20):
     return APIResponse(message="Matches fetched", data=response.data)
 
 
+@router.get("/live", response_model=APIResponse)
+async def get_live_matches():
+    """Get all live matches for the homepage."""
+    res = (
+        supabase.table("matches")
+        .select("*")
+        .in_("status", ["toss", "playing", "innings_break"])
+        .order("created_at", desc=True)
+        .execute()
+    )
+    
+    matches_list = res.data or []
+    if not matches_list:
+        return APIResponse(message="No live matches found", data=[])
+        
+    team_ids = set()
+    for m in matches_list:
+        team_ids.add(m["team_a_id"])
+        team_ids.add(m["team_b_id"])
+        
+    teams_res = supabase.table("teams").select("id, name, avatar_color").in_("id", list(team_ids)).execute()
+    teams_map = {t["id"]: t for t in (teams_res.data or [])}
+    
+    def get_initials(name):
+        if not name:
+            return "??"
+        parts = name.strip().split()
+        if len(parts) > 1:
+            return (parts[0][0] + parts[-1][0]).upper()
+        return name[:2].upper()
+
+    live_matches = []
+    for m in matches_list:
+        match_id = m["id"]
+        
+        innings_res = (
+            supabase.table("innings")
+            .select("*")
+            .eq("match_id", match_id)
+            .order("innings_number", desc=True)
+            .limit(1)
+            .execute()
+        )
+        current_innings = innings_res.data[0] if innings_res.data else None
+        
+        team_a_meta = teams_map.get(m["team_a_id"], {})
+        team_b_meta = teams_map.get(m["team_b_id"], {})
+        
+        team_a = {
+            "id": m["team_a_id"],
+            "name": team_a_meta.get("name", "Team A"),
+            "initials": get_initials(team_a_meta.get("name")),
+            "color": team_a_meta.get("avatar_color", "#7c3aed")
+        }
+        team_b = {
+            "id": m["team_b_id"],
+            "name": team_b_meta.get("name", "Team B"),
+            "initials": get_initials(team_b_meta.get("name")),
+            "color": team_b_meta.get("avatar_color", "#3b82f6")
+        }
+        
+        live_matches.append({
+            "id": match_id,
+            "match_type": m["match_type"],
+            "status": m["status"],
+            "team_a": team_a,
+            "team_b": team_b,
+            "current_innings": current_innings
+        })
+        
+    return APIResponse(message="Live matches retrieved", data=live_matches)
+
+
 @router.get("/{match_id}", response_model=APIResponse)
 async def get_match(match_id: str):
-    """Get a single match by ID."""
+    """Get full state for a single match."""
     response = supabase.table("matches").select("*").eq("id", match_id).single().execute()
     if not response.data:
         raise HTTPException(status_code=404, detail="Match not found")
-    return APIResponse(message="Match fetched", data=response.data)
+        
+    match_data = response.data
+    team_a_id = match_data["team_a_id"]
+    team_b_id = match_data["team_b_id"]
+
+    teams_res = supabase.table("teams").select("id, name, avatar_color").in_("id", [team_a_id, team_b_id]).execute()
+    teams_map = {t["id"]: t for t in (teams_res.data or [])}
+    
+    def get_initials(name):
+        if not name:
+            return "??"
+        parts = name.strip().split()
+        if len(parts) > 1:
+            return (parts[0][0] + parts[-1][0]).upper()
+        return name[:2].upper()
+
+    team_a_meta = teams_map.get(team_a_id, {})
+    team_b_meta = teams_map.get(team_b_id, {})
+    
+    team_a = {
+        "id": team_a_id,
+        "name": team_a_meta.get("name", "Team A"),
+        "initials": get_initials(team_a_meta.get("name")),
+        "color": team_a_meta.get("avatar_color", "#7c3aed")
+    }
+    team_b = {
+        "id": team_b_id,
+        "name": team_b_meta.get("name", "Team B"),
+        "initials": get_initials(team_b_meta.get("name")),
+        "color": team_b_meta.get("avatar_color", "#3b82f6")
+    }
+
+    squads_res = supabase.table("match_squads").select(
+        "id, team_id, user_id, batting_order, is_captain, is_vc, users(id, first_name, last_name, phone, avatar_color)"
+    ).eq("match_id", match_id).execute()
+    
+    squad_a = []
+    squad_b = []
+    
+    for sq in (squads_res.data or []):
+        u = sq.get("users") or {}
+        first = u.get("first_name", "")
+        last = u.get("last_name", "")
+        full_name = f"{first} {last}".strip()
+        player_obj = {
+            "id": u.get("id"),
+            "name": full_name or "Unknown Player",
+            "initials": (first[0] if first else "") + (last[0] if last else ""),
+            "role": "Batsman",
+            "jersey": 0,
+            "isCaptain": sq.get("is_captain", False),
+            "isVC": sq.get("is_vc", False),
+            "batting_order": sq.get("batting_order")
+        }
+        if not player_obj["initials"]:
+            player_obj["initials"] = get_initials(player_obj["name"])
+            
+        if sq["team_id"] == team_a_id:
+            squad_a.append(player_obj)
+        else:
+            squad_b.append(player_obj)
+
+    squad_a.sort(key=lambda x: x.get("batting_order") or 99)
+    squad_b.sort(key=lambda x: x.get("batting_order") or 99)
+
+    innings_res = supabase.table("innings").select("*").eq("match_id", match_id).order("innings_number").execute()
+    innings_list = innings_res.data or []
+
+    scorecard = await _build_scorecard(match_id)
+
+    full_state = {
+        "match": match_data,
+        "team_a": team_a,
+        "team_b": team_b,
+        "squad_a": squad_a,
+        "squad_b": squad_b,
+        "innings": innings_list,
+        "scorecard": scorecard
+    }
+    
+    return APIResponse(message="Match state fetched", data=full_state)
 
 
 # ─── Toss ─────────────────────────────────────────────────────────────────────
@@ -173,6 +303,30 @@ async def record_toss(match_id: str, toss: TossRecord):
     if not response.data:
         raise HTTPException(status_code=400, detail="Failed to record toss")
     return APIResponse(message="Toss recorded", data=response.data[0])
+
+
+@router.post("/{match_id}/squads", response_model=APIResponse)
+async def submit_match_squad(match_id: str, squad: SquadSubmit, user: dict = Depends(get_current_user)):
+    """Submit playing XI squad for a team in a match."""
+    # Delete existing squad entries for this match + team
+    supabase.table("match_squads").delete().eq("match_id", match_id).eq("team_id", squad.team_id).execute()
+    
+    payloads = []
+    for idx, player_id in enumerate(squad.player_ids):
+        payloads.append({
+            "match_id": match_id,
+            "team_id": squad.team_id,
+            "user_id": player_id,
+            "batting_order": idx + 1,
+            "is_captain": player_id == squad.captain_id,
+            "is_vc": player_id == squad.vice_captain_id
+        })
+        
+    res = supabase.table("match_squads").insert(payloads).execute()
+    if not res.data:
+        raise HTTPException(status_code=400, detail="Failed to submit match squad")
+        
+    return APIResponse(message="Playing XI submitted successfully", data=res.data)
 
 
 # ─── Innings ──────────────────────────────────────────────────────────────────
