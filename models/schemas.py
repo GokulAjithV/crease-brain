@@ -215,6 +215,13 @@ class TossRecord(BaseModel):
     toss_election: str = Field(..., pattern="^(bat|bowl)$", description="Elected to bat or bowl")
 
 
+class SquadSubmit(BaseModel):
+    team_id: str = Field(..., description="Team UUID")
+    player_ids: List[str] = Field(..., description="List of player UUIDs selected for the Playing XI")
+    captain_id: Optional[str] = Field(None, description="UUID of the selected Captain")
+    vice_captain_id: Optional[str] = Field(None, description="UUID of the selected Vice Captain")
+
+
 # ─── Innings Models ──────────────────────────────────────────────────────────
 
 class InningsCreate(BaseModel):
