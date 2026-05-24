@@ -38,7 +38,7 @@ class MatchStatus(str, Enum):
 
 class InningsStatus(str, Enum):
     NOT_STARTED = "not_started"
-    ONGOING = "ongoing"
+    PLAYING = "playing"
     COMPLETED = "completed"
 
 
@@ -229,6 +229,29 @@ class InningsCreate(BaseModel):
     batting_team: str = Field(..., description="Team id batting this innings")
     bowling_team: str = Field(..., description="Team id bowling this innings")
     innings_number: int = Field(..., ge=1, le=4)
+
+
+class InningsStart(BaseModel):
+    innings_number: int = Field(..., ge=1, le=4)
+    batting_team_id: str = Field(..., description="Team UUID batting this innings")
+    bowling_team_id: str = Field(..., description="Team UUID bowling this innings")
+
+
+class OverStart(BaseModel):
+    over_number: int = Field(..., ge=1)
+    bowler_id: str = Field(..., description="Bowler user UUID")
+
+
+class DeliveryCreate(BaseModel):
+    batsman_id: str = Field(..., description="Batsman user UUID")
+    non_striker_id: str = Field(..., description="Non-striker user UUID")
+    bowler_id: str = Field(..., description="Bowler user UUID")
+    runs_batsman: int = Field(0, ge=0)
+    runs_extras: int = Field(0, ge=0)
+    extra_type: Optional[str] = Field(None, pattern="^(wide|noball|bye|legbye)$", description="Type of extra: wide, noball, bye, legbye")
+    is_wicket: bool = Field(False)
+    wicket_type: Optional[str] = Field(None, description="Dismissal type")
+    dismissed_id: Optional[str] = Field(None, description="Dismissed player user UUID")
 
 
 class InningsResponse(BaseModel):

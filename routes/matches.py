@@ -14,7 +14,10 @@ from models.schemas import (
     TossRecord,
     SquadSubmit,
     InningsCreate,
+    InningsStart,
     InningsResponse,
+    OverStart,
+    DeliveryCreate,
     BallEventCreate,
     BallEventResponse,
     APIResponse,
@@ -22,6 +25,7 @@ from models.schemas import (
 from services.db import supabase
 from services.websocket import manager
 from services.auth import get_current_user
+from postgrest.types import CountMethod
 
 router = APIRouter(prefix="/matches", tags=["matches"])
 
@@ -29,7 +33,7 @@ router = APIRouter(prefix="/matches", tags=["matches"])
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 async def _build_scorecard(match_id: str) -> dict | None:
-    """Compute a live scorecard from innings + overs tables."""
+    """Compute a live scorecard from innings, overs, and deliveries tables."""
     innings_res = (
         supabase.table("innings")
         .select("*")
@@ -42,27 +46,85 @@ async def _build_scorecard(match_id: str) -> dict | None:
     if not innings_data:
         return None
 
+    # Fetch squad players to resolve names
+    squad_res = (
+        supabase.table("match_squads")
+        .select("user_id, users(first_name, last_name)")
+        .eq("match_id", match_id)
+        .execute()
+    )
+    squad_map = {}
+    for sq in (squad_res.data or []):
+        u = sq.get("users") or {}
+        first = u.get("first_name", "")
+        last = u.get("last_name", "")
+        squad_map[sq["user_id"]] = f"{first} {last}".strip() or "Player"
+
     scorecard = []
     for inn in innings_data:
         innings_id = inn["id"]
-        # Fetch overs to see bowlers performance
-        overs_res = (
-            supabase.table("overs")
-            .select("*")
+        
+        # Query all deliveries for this innings
+        deliveries_res = (
+            supabase.table("deliveries")
+            .select("runs_batsman, runs_extras, extra_type, is_wicket, wicket_type, batsman_id, non_striker_id, bowler_id")
             .eq("innings_id", innings_id)
             .execute()
         )
-        overs_data = overs_res.data or []
+        deliveries = deliveries_res.data or []
 
-        # Bowler aggregations from overs
+        batsmen = {}
         bowlers = {}
-        for o in overs_data:
-            brid = o["bowler_id"]
+        
+        for d in deliveries:
+            bid = d["batsman_id"]
+            brid = d["bowler_id"]
+            
+            # Batsman stats
+            if bid not in batsmen:
+                batsmen[bid] = {"runs": 0, "balls": 0, "fours": 0, "sixes": 0}
+            batsmen[bid]["runs"] += d.get("runs_batsman") or 0
+            if d.get("extra_type") != "wide":
+                batsmen[bid]["balls"] += 1
+            if d.get("runs_batsman") == 4:
+                batsmen[bid]["fours"] += 1
+            if d.get("runs_batsman") == 6:
+                batsmen[bid]["sixes"] += 1
+                
+            # Bowler stats
             if brid not in bowlers:
-                bowlers[brid] = {"runs": 0, "wickets": 0, "overs": 0}
-            bowlers[brid]["runs"] += o.get("runs") or 0
-            bowlers[brid]["wickets"] += o.get("wickets") or 0
-            bowlers[brid]["overs"] += 1
+                bowlers[brid] = {"runs": 0, "wickets": 0, "balls": 0}
+            
+            extra_type = d.get("extra_type")
+            extra_runs = d.get("runs_extras") or 0
+            batsman_runs = d.get("runs_batsman") or 0
+            if extra_type in ["wide", "noball"]:
+                bowlers[brid]["runs"] += batsman_runs + extra_runs
+            else:
+                bowlers[brid]["runs"] += batsman_runs
+                
+            if d.get("is_wicket") and d.get("wicket_type") in ["bowled", "caught", "lbw", "stumped", "hit_wicket"]:
+                bowlers[brid]["wickets"] += 1
+                
+            if extra_type not in ["wide", "noball"]:
+                bowlers[brid]["balls"] += 1
+
+        formatted_batsmen = {}
+        for bid, stats in batsmen.items():
+            formatted_batsmen[bid] = {
+                "name": squad_map.get(bid, "Unknown Batsman"),
+                **stats
+            }
+            
+        formatted_bowlers = {}
+        for brid, stats in bowlers.items():
+            b_balls = stats["balls"]
+            formatted_bowlers[brid] = {
+                "name": squad_map.get(brid, "Unknown Bowler"),
+                "runs": stats["runs"],
+                "wickets": stats["wickets"],
+                "overs": f"{b_balls // 6}.{b_balls % 6}"
+            }
 
         scorecard.append({
             "innings_id": innings_id,
@@ -72,8 +134,8 @@ async def _build_scorecard(match_id: str) -> dict | None:
             "total_runs": inn.get("total_runs") or 0,
             "total_wickets": inn.get("total_wickets") or 0,
             "overs": str(inn.get("overs_played") or "0.0"),
-            "bowlers": bowlers,
-            "batsmen": {} # No deliveries table, returning empty dict
+            "bowlers": formatted_bowlers,
+            "batsmen": formatted_batsmen
         })
 
     return {"match_id": match_id, "scorecard": scorecard}
@@ -270,6 +332,12 @@ async def get_match(match_id: str):
     innings_res = supabase.table("innings").select("*").eq("match_id", match_id).order("innings_number").execute()
     innings_list = innings_res.data or []
 
+    overs_res = supabase.table("overs").select("*").eq("match_id", match_id).order("over_number").execute()
+    overs_list = overs_res.data or []
+
+    deliveries_res = supabase.table("deliveries").select("*").eq("match_id", match_id).execute()
+    deliveries_list = deliveries_res.data or []
+
     scorecard = await _build_scorecard(match_id)
 
     full_state = {
@@ -279,6 +347,8 @@ async def get_match(match_id: str):
         "squad_a": squad_a,
         "squad_b": squad_b,
         "innings": innings_list,
+        "overs": overs_list,
+        "deliveries": deliveries_list,
         "scorecard": scorecard
     }
     
@@ -331,15 +401,34 @@ async def submit_match_squad(match_id: str, squad: SquadSubmit, user: dict = Dep
 
 # ─── Innings ──────────────────────────────────────────────────────────────────
 
-@router.post("/{match_id}/innings", response_model=APIResponse)
-async def start_innings(match_id: str, innings: InningsCreate):
+@router.post("/{match_id}/innings/start", response_model=APIResponse)
+async def start_innings(match_id: str, innings: InningsStart, user: dict = Depends(get_current_user)):
     """Start a new innings within a match."""
+    # Check if this innings already exists
+    existing = (
+        supabase.table("innings")
+        .select("*")
+        .eq("match_id", match_id)
+        .eq("innings_number", innings.innings_number)
+        .execute()
+    )
+    if existing.data:
+        supabase.table("matches").update({"status": "playing"}).eq("id", match_id).execute()
+        return APIResponse(message="Innings already started", data=existing.data[0])
+
     payload = {
         "match_id": match_id,
-        "batting_team": innings.batting_team,
-        "bowling_team": innings.bowling_team,
         "innings_number": innings.innings_number,
-        "status": "ongoing",
+        "batting_team_id": innings.batting_team_id,
+        "bowling_team_id": innings.bowling_team_id,
+        "total_runs": 0,
+        "total_wickets": 0,
+        "overs_played": 0.0,
+        "status": "playing",
+        "extras_wide": 0,
+        "extras_noball": 0,
+        "extras_bye": 0,
+        "extras_legbye": 0
     }
     response = supabase.table("innings").insert(payload).execute()
     if not response.data:
@@ -348,46 +437,190 @@ async def start_innings(match_id: str, innings: InningsCreate):
     # Update match status to playing
     supabase.table("matches").update({"status": "playing"}).eq("id", match_id).execute()
 
-    return APIResponse(message="Innings started", data=response.data)
+    return APIResponse(message="Innings started", data=response.data[0])
+
+
+@router.post("/innings/{innings_id}/over/start", response_model=APIResponse)
+async def start_over(innings_id: str, over: OverStart, user: dict = Depends(get_current_user)):
+    """Start a new over within an innings."""
+    # Retrieve the innings to get the match_id
+    innings_res = supabase.table("innings").select("*").eq("id", innings_id).single().execute()
+    if not innings_res.data:
+        raise HTTPException(status_code=404, detail="Innings not found")
+    
+    match_id = innings_res.data["match_id"]
+    
+    # Check if the over already exists
+    existing_over = (
+        supabase.table("overs")
+        .select("*")
+        .eq("innings_id", innings_id)
+        .eq("over_number", over.over_number)
+        .execute()
+    )
+    if existing_over.data:
+        current_over = existing_over.data[0]
+        if current_over["bowler_id"] != over.bowler_id:
+            update_res = (
+                supabase.table("overs")
+                .update({"bowler_id": over.bowler_id})
+                .eq("id", current_over["id"])
+                .execute()
+            )
+            return APIResponse(message="Over updated with new bowler", data=update_res.data[0])
+        return APIResponse(message="Over already started", data=current_over)
+
+    payload = {
+        "innings_id": innings_id,
+        "match_id": match_id,
+        "over_number": over.over_number,
+        "bowler_id": over.bowler_id,
+        "runs": 0,
+        "wickets": 0,
+        "is_completed": False
+    }
+    res = supabase.table("overs").insert(payload).execute()
+    if not res.data:
+        raise HTTPException(status_code=400, detail="Failed to start over")
+    return APIResponse(message="Over started successfully", data=res.data[0])
 
 
 # ─── Ball-by-Ball ─────────────────────────────────────────────────────────────
 
-@router.post("/{match_id}/innings/{innings_id}/ball", response_model=APIResponse)
-async def record_ball(match_id: str, innings_id: str, ball: BallEventCreate):
-    """Record a single delivery and broadcast live update via WebSocket."""
-    payload = {
+@router.post("/innings/{innings_id}/deliver", response_model=APIResponse)
+async def record_delivery(innings_id: str, ball: DeliveryCreate, user: dict = Depends(get_current_user)):
+    """Record a single delivery and broadcast scorecard update."""
+    # 1. Fetch innings
+    innings_res = supabase.table("innings").select("*").eq("id", innings_id).single().execute()
+    if not innings_res.data:
+        raise HTTPException(status_code=404, detail="Innings not found")
+    innings = innings_res.data
+    match_id = innings["match_id"]
+    
+    # 2. Fetch current active over
+    overs_res = (
+        supabase.table("overs")
+        .select("*")
+        .eq("innings_id", innings_id)
+        .eq("is_completed", False)
+        .execute()
+    )
+    if not overs_res.data:
+        raise HTTPException(status_code=400, detail="No active over found. Please start an over first.")
+    active_over = overs_res.data[0]
+    over_id = active_over["id"]
+    over_number = active_over["over_number"]
+    
+    # 3. Calculate ball numbers in current over
+    prev_deliveries_res = (
+        supabase.table("deliveries")
+        .select("id, extra_type")
+        .eq("over_id", over_id)
+        .execute()
+    )
+    prev_deliveries = prev_deliveries_res.data or []
+    raw_ball_number = len(prev_deliveries) + 1
+    
+    legal_balls_so_far = sum(
+        1 for d in prev_deliveries 
+        if d.get("extra_type") not in ["wide", "noball"]
+    )
+    
+    is_legal = ball.extra_type not in ["wide", "noball"]
+    ball_number = legal_balls_so_far + 1 if is_legal else legal_balls_so_far
+    
+    # 4. Insert delivery row
+    total_runs = (innings.get("total_runs") or 0) + ball.runs_batsman + ball.runs_extras
+    
+    delivery_payload = {
+        "match_id": match_id,
         "innings_id": innings_id,
-        "over_number": ball.over_number,
-        "ball_number": ball.ball_number,
+        "over_id": over_id,
+        "over_number": over_number,
+        "ball_number": ball_number,
+        "raw_ball_number": raw_ball_number,
         "batsman_id": ball.batsman_id,
         "non_striker_id": ball.non_striker_id,
         "bowler_id": ball.bowler_id,
-        "runs": ball.runs,
+        "runs_batsman": ball.runs_batsman,
+        "runs_extras": ball.runs_extras,
+        "extra_type": ball.extra_type,
         "is_wicket": ball.is_wicket,
-        "extras": ball.extras,
+        "wicket_type": ball.wicket_type,
+        "dismissed_id": ball.dismissed_id,
     }
-    if ball.wicket_type:
-        payload["wicket_type"] = ball.wicket_type.value
-    if ball.dismissed_player_id:
-        payload["dismissed_player_id"] = ball.dismissed_player_id
-    if ball.fielder_id:
-        payload["fielder_id"] = ball.fielder_id
-    if ball.extra_type:
-        payload["extra_type"] = ball.extra_type.value
-    if ball.commentary:
-        payload["commentary"] = ball.commentary
-
-    response = supabase.table("deliveries").insert(payload).execute()
-    if not response.data:
-        raise HTTPException(status_code=400, detail="Failed to record delivery")
-
-    # Broadcast updated scorecard to all WebSocket viewers
+    
+    delivery_res = supabase.table("deliveries").insert(delivery_payload).execute()
+    if not delivery_res.data:
+        raise HTTPException(status_code=400, detail="Failed to insert delivery record")
+        
+    # 5. Update overs table
+    bowler_runs = ball.runs_batsman + (ball.runs_extras if ball.extra_type in ["wide", "noball"] else 0)
+    bowler_wicket = 1 if (ball.is_wicket and ball.wicket_type in ["bowled", "caught", "lbw", "stumped", "hit_wicket"]) else 0
+    
+    legal_balls_in_over = legal_balls_so_far + (1 if is_legal else 0)
+    is_over_completed = (legal_balls_in_over == 6)
+    
+    updated_over_runs = (active_over.get("runs") or 0) + bowler_runs
+    updated_over_wickets = (active_over.get("wickets") or 0) + bowler_wicket
+    
+    supabase.table("overs").update({
+        "runs": updated_over_runs,
+        "wickets": updated_over_wickets,
+        "is_completed": is_over_completed
+    }).eq("id", over_id).execute()
+    
+    # 6. Update innings table
+    updated_innings_runs = total_runs
+    updated_innings_wickets = (innings.get("total_wickets") or 0) + (1 if ball.is_wicket else 0)
+    
+    extras_payload = {}
+    if ball.extra_type == "wide":
+        extras_payload["extras_wide"] = (innings.get("extras_wide") or 0) + ball.runs_extras
+    elif ball.extra_type == "noball":
+        extras_payload["extras_noball"] = (innings.get("extras_noball") or 0) + ball.runs_extras
+    elif ball.extra_type == "bye":
+        extras_payload["extras_bye"] = (innings.get("extras_bye") or 0) + ball.runs_extras
+    elif ball.extra_type == "legbye":
+        extras_payload["extras_legbye"] = (innings.get("extras_legbye") or 0) + ball.runs_extras
+        
+    # Calculate completed overs count
+    completed_overs_count_res = (
+        supabase.table("overs")
+        .select("id", count=CountMethod.exact)
+        .eq("innings_id", innings_id)
+        .eq("is_completed", True)
+        .execute()
+    )
+    completed_overs_count = completed_overs_count_res.count or 0
+    
+    if is_over_completed:
+        overs_played = float(completed_overs_count)
+    else:
+        overs_played = completed_overs_count + (legal_balls_in_over / 10.0)
+        
+    innings_update_payload = {
+        "total_runs": updated_innings_runs,
+        "total_wickets": updated_innings_wickets,
+        "overs_played": overs_played,
+        **extras_payload
+    }
+    supabase.table("innings").update(innings_update_payload).eq("id", innings_id).execute()
+    
+    # 7. Get full computed scorecard
     scorecard = await _build_scorecard(match_id)
+    
+    # Broadcast updated scorecard to all WebSocket viewers
     if scorecard:
         await manager.broadcast(match_id, scorecard)
+        
+    return APIResponse(message="Delivery recorded successfully", data=scorecard)
 
-    return APIResponse(message="Ball recorded", data=response.data)
+
+@router.post("/innings/{innings_id}/wicket", response_model=APIResponse)
+async def record_wicket(innings_id: str, ball: DeliveryCreate, user: dict = Depends(get_current_user)):
+    """Record a wicket (aliases /deliver)."""
+    return await record_delivery(innings_id, ball, user)
 
 
 # ─── Scorecard ────────────────────────────────────────────────────────────────
