@@ -250,6 +250,7 @@ async def get_live_matches():
             "id": match_id,
             "match_type": m["match_type"],
             "status": m["status"],
+            "created_by": m.get("created_by"),
             "team_a": team_a,
             "team_b": team_b,
             "current_innings": current_innings
