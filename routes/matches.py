@@ -301,19 +301,40 @@ async def get_match(match_id: str):
         "id, team_id, user_id, batting_order, is_captain, is_vc, users(id, first_name, last_name, phone, avatar_color)"
     ).eq("match_id", match_id).execute()
     
+    team_players_res = (
+        supabase.table("team_players")
+        .select("team_id, user_id, role")
+        .in_("team_id", [team_a_id, team_b_id])
+        .execute()
+    )
+    tp_map = {}
+    for tp in (team_players_res.data or []):
+        tp_map[(tp["team_id"], tp["user_id"])] = tp.get("role")
+        
     squad_a = []
     squad_b = []
+    
+    role_map = {
+        "BAT": "Batsman",
+        "BOWL": "Bowler",
+        "ALL": "All-Rounder",
+        "WK": "WK-Batsman"
+    }
     
     for sq in (squads_res.data or []):
         u = sq.get("users") or {}
         first = u.get("first_name", "")
         last = u.get("last_name", "")
         full_name = f"{first} {last}".strip()
+        
+        role_code = tp_map.get((sq["team_id"], sq["user_id"])) or "BAT"
+        role_str = role_map.get(role_code.upper(), "Batsman")
+        
         player_obj = {
             "id": u.get("id"),
             "name": full_name or "Unknown Player",
             "initials": (first[0] if first else "") + (last[0] if last else ""),
-            "role": "Batsman",
+            "role": role_str,
             "jersey": 0,
             "isCaptain": sq.get("is_captain", False),
             "isVC": sq.get("is_vc", False),
@@ -449,7 +470,24 @@ async def start_over(innings_id: str, over: OverStart, user: dict = Depends(get_
     if not innings_res.data:
         raise HTTPException(status_code=404, detail="Innings not found")
     
-    match_id = innings_res.data["match_id"]
+    innings_data = innings_res.data
+    match_id = innings_data["match_id"]
+    
+    # Block if innings is already completed
+    if innings_data.get("status") == "completed":
+        raise HTTPException(status_code=400, detail="Innings is already completed")
+
+    # Check consecutive bowler restriction (only if over_number > 1)
+    if over.over_number > 1:
+        prev_over_res = (
+            supabase.table("overs")
+            .select("bowler_id")
+            .eq("innings_id", innings_id)
+            .eq("over_number", over.over_number - 1)
+            .execute()
+        )
+        if prev_over_res.data and prev_over_res.data[0]["bowler_id"] == over.bowler_id:
+            raise HTTPException(status_code=400, detail="A bowler cannot bowl consecutive overs")
     
     # Check if the over already exists
     existing_over = (
@@ -497,6 +535,10 @@ async def record_delivery(innings_id: str, ball: DeliveryCreate, user: dict = De
         raise HTTPException(status_code=404, detail="Innings not found")
     innings = innings_res.data
     match_id = innings["match_id"]
+    
+    # Block if innings is already completed
+    if innings.get("status") == "completed":
+        raise HTTPException(status_code=400, detail="Innings is already completed")
     
     # 2. Fetch current active over
     overs_res = (
@@ -606,7 +648,63 @@ async def record_delivery(innings_id: str, ball: DeliveryCreate, user: dict = De
         "overs_played": overs_played,
         **extras_payload
     }
+    
+    # Check for innings completion
+    is_innings_completed = False
+    is_match_completed = False
+    
+    # Get batting squad size
+    batting_team_id = innings["batting_team_id"]
+    squad_count_res = (
+        supabase.table("match_squads")
+        .select("id", count=CountMethod.exact)
+        .eq("match_id", match_id)
+        .eq("team_id", batting_team_id)
+        .execute()
+    )
+    batting_squad_size = squad_count_res.count or 11
+    max_wickets = max(batting_squad_size - 1, 1)
+    
+    # 1. Check all-out
+    if updated_innings_wickets >= max_wickets:
+        is_innings_completed = True
+        
+    # 2. Check overs limit
+    match_res = supabase.table("matches").select("*").eq("id", match_id).single().execute()
+    match_data = match_res.data
+    total_overs = match_data.get("total_overs") or 20
+    
+    if overs_played >= total_overs:
+        is_innings_completed = True
+        
+    # 3. For Innings 2, check if target chased
+    if innings["innings_number"] == 2:
+        # Fetch innings 1
+        inn1_res = (
+            supabase.table("innings")
+            .select("total_runs")
+            .eq("match_id", match_id)
+            .eq("innings_number", 1)
+            .execute()
+        )
+        if inn1_res.data:
+            inn1_runs = inn1_res.data[0]["total_runs"] or 0
+            if updated_innings_runs > inn1_runs:
+                is_innings_completed = True
+                is_match_completed = True
+            elif is_innings_completed:
+                # Innings 2 completed (all out or overs limit reached) and target not chased
+                is_match_completed = True
+    
+    if is_innings_completed:
+        innings_update_payload["status"] = "completed"
+        
     supabase.table("innings").update(innings_update_payload).eq("id", innings_id).execute()
+    
+    if is_match_completed:
+        supabase.table("matches").update({"status": "completed"}).eq("id", match_id).execute()
+    elif is_innings_completed:
+        supabase.table("matches").update({"status": "innings_break"}).eq("id", match_id).execute()
     
     # 7. Get full computed scorecard
     scorecard = await _build_scorecard(match_id)
