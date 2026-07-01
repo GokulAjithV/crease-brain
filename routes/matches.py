@@ -702,7 +702,39 @@ async def record_delivery(innings_id: str, ball: DeliveryCreate, user: dict = De
     supabase.table("innings").update(innings_update_payload).eq("id", innings_id).execute()
     
     if is_match_completed:
-        supabase.table("matches").update({"status": "completed"}).eq("id", match_id).execute()
+        from datetime import datetime, timezone
+        completed_at = datetime.now(timezone.utc).isoformat()
+        
+        winner_id = None
+        win_type = None
+        win_margin = None
+        
+        inn2_runs = updated_innings_runs
+        inn2_wickets = updated_innings_wickets
+        
+        if inn2_runs > inn1_runs:
+            # Innings 2 batting team chased down the target
+            winner_id = innings["batting_team_id"]
+            win_type = "wickets"
+            win_margin = max(max_wickets - inn2_wickets, 0)
+        elif inn2_runs < inn1_runs:
+            # Innings 1 batting team defended the score
+            winner_id = innings["bowling_team_id"]
+            win_type = "runs"
+            win_margin = inn1_runs - inn2_runs
+        else:
+            # Tie
+            winner_id = None
+            win_type = None
+            win_margin = 0
+            
+        supabase.table("matches").update({
+            "status": "completed",
+            "winner_id": winner_id,
+            "win_type": win_type,
+            "win_margin": win_margin,
+            "completed_at": completed_at
+        }).eq("id", match_id).execute()
     elif is_innings_completed:
         supabase.table("matches").update({"status": "innings_break"}).eq("id", match_id).execute()
     
@@ -731,6 +763,209 @@ async def get_scorecard(match_id: str):
     if scorecard is None:
         raise HTTPException(status_code=404, detail="No scorecard data found")
     return scorecard
+
+
+@router.get("/{match_id}/summary", response_model=APIResponse)
+async def get_match_summary(match_id: str):
+    """Fetch match summary, top performers, and Crease AI insights."""
+    # 1. Fetch match details
+    match_res = (
+        supabase.table("matches")
+        .select("*, team_a:team_a_id(*), team_b:team_b_id(*)")
+        .eq("id", match_id)
+        .single()
+        .execute()
+    )
+    if not match_res.data:
+        raise HTTPException(status_code=404, detail="Match not found")
+    
+    match_data = match_res.data
+    team_a = match_data.get("team_a") or {}
+    team_b = match_data.get("team_b") or {}
+    
+    # 2. Get toss winner name
+    toss_winner_name = None
+    if match_data.get("toss_winner_id"):
+        if match_data["toss_winner_id"] == team_a.get("id"):
+            toss_winner_name = team_a.get("name")
+        elif match_data["toss_winner_id"] == team_b.get("id"):
+            toss_winner_name = team_b.get("name")
+            
+    # 3. Get winner name
+    winner_name = None
+    if match_data.get("winner_id"):
+        if match_data["winner_id"] == team_a.get("id"):
+            winner_name = team_a.get("name")
+        elif match_data["winner_id"] == team_b.get("id"):
+            winner_name = team_b.get("name")
+
+    # 4. Fetch computed scorecard
+    scorecard_data = await _build_scorecard(match_id)
+    innings_summaries = []
+    all_batters = []
+    all_bowlers = []
+    phase_runs = {
+        1: {"pp": 0, "mid": 0, "death": 0},
+        2: {"pp": 0, "mid": 0, "death": 0}
+    }
+    
+    if scorecard_data and "scorecard" in scorecard_data:
+        for card in scorecard_data["scorecard"]:
+            inn_num = card["innings_number"]
+            batting_team_id = card["batting_team_id"]
+            bowling_team_id = card["bowling_team_id"]
+            inn_id = card["innings_id"]
+            
+            # Query deliveries to calculate phase runs for momentum chart
+            del_res = supabase.table("deliveries").select("runs_batsman, runs_extras, extra_type").eq("innings_id", inn_id).execute()
+            dels = del_res.data or []
+            
+            legal_ball_count = 0
+            for d in dels:
+                extra_type = d.get("extra_type")
+                is_legal = extra_type not in ["wide", "noball"]
+                ball_runs = (d.get("runs_batsman") or 0) + (d.get("runs_extras") or 0)
+                
+                curr_over = legal_ball_count // 6
+                if curr_over < 6:
+                    phase_runs[inn_num]["pp"] += ball_runs
+                elif curr_over < 14:
+                    phase_runs[inn_num]["mid"] += ball_runs
+                else:
+                    phase_runs[inn_num]["death"] += ball_runs
+                    
+                if is_legal:
+                    legal_ball_count += 1
+            
+            # Resolve team names
+            bat_team_name = team_a.get("name") if batting_team_id == team_a.get("id") else team_b.get("name")
+            bowl_team_name = team_a.get("name") if bowling_team_id == team_a.get("id") else team_b.get("name")
+            
+            # Find top batter in this innings
+            top_bat = {"name": "N/A", "runs": 0, "balls": 0}
+            for bid, b_stats in card["batsmen"].items():
+                # Add to overall batters list for performers tab
+                all_batters.append({
+                    "name": b_stats["name"],
+                    "team_name": bat_team_name,
+                    "runs": b_stats["runs"],
+                    "balls": b_stats["balls"],
+                    "fours": b_stats.get("fours", 0),
+                    "sixes": b_stats.get("sixes", 0),
+                    "sr": round((b_stats["runs"] / b_stats["balls"] * 100.0) if b_stats["balls"] > 0 else 0.0, 1)
+                })
+                
+                # Check if this batter is the top in this innings
+                if b_stats["runs"] > top_bat["runs"]:
+                    top_bat = {
+                        "name": b_stats["name"],
+                        "runs": b_stats["runs"],
+                        "balls": b_stats["balls"]
+                    }
+                    
+            # Find top bowler in this innings
+            top_bowl = {"name": "N/A", "wickets": 0, "runs": 999, "overs": "0.0"}
+            for brid, b_stats in card["bowlers"].items():
+                overs_str = b_stats["overs"]
+                # Parse overs to float to calculate economy
+                try:
+                    parts = overs_str.split('.')
+                    ov = int(parts[0])
+                    bl = int(parts[1]) if len(parts) > 1 else 0
+                    total_balls = ov * 6 + bl
+                    econ = round((b_stats["runs"] / (total_balls / 6)) if total_balls > 0 else 0.0, 1)
+                except Exception:
+                    total_balls = 0
+                    econ = 0.0
+                    
+                # Add to overall bowlers list
+                all_bowlers.append({
+                    "name": b_stats["name"],
+                    "team_name": bowl_team_name,
+                    "wickets": b_stats["wickets"],
+                    "runs": b_stats["runs"],
+                    "overs": overs_str,
+                    "econ": econ
+                })
+                
+                # Check top bowler (highest wickets, if tied, lowest runs conceded)
+                if (b_stats["wickets"] > top_bowl["wickets"] or 
+                    (b_stats["wickets"] == top_bowl["wickets"] and b_stats["runs"] < top_bowl["runs"])):
+                    top_bowl = {
+                        "name": b_stats["name"],
+                        "wickets": b_stats["wickets"],
+                        "runs": b_stats["runs"],
+                        "overs": overs_str
+                    }
+                    
+            innings_summaries.append({
+                "innings_number": inn_num,
+                "batting_team_id": batting_team_id,
+                "batting_team_name": bat_team_name,
+                "bowling_team_name": bowl_team_name,
+                "total_runs": card["total_runs"],
+                "total_wickets": card["total_wickets"],
+                "overs_played": card["overs"],
+                "top_batsman": f"{top_bat['name']} — {top_bat['runs']}({top_bat['balls']})",
+                "top_bowler": f"{top_bowl['name']} — {top_bowl['wickets']}/{top_bowl['runs']}({top_bowl['overs']})" if top_bowl["name"] != "N/A" else "N/A"
+            })
+            
+    # Sort overall lists by performance
+    all_batters.sort(key=lambda x: (-x["runs"], x["balls"]))
+    all_bowlers.sort(key=lambda x: (-x["wickets"], x["runs"]))
+    
+    # Assign ranks
+    for idx, b in enumerate(all_batters):
+        b["rank"] = idx + 1
+    for idx, b in enumerate(all_bowlers):
+        b["rank"] = idx + 1
+        
+    # 5. Generate AI insights text
+    ai_insights = []
+    if match_data.get("status") == "completed" and winner_name:
+        margin_str = f"by {match_data['win_margin']} {match_data['win_type']}" if match_data.get("win_margin") else ""
+        ai_insights.append(
+            f"**{winner_name}** dominated the match to win {margin_str}."
+        )
+        # Add batter highlight
+        if all_batters:
+            top_b = all_batters[0]
+            ai_insights.append(
+                f"**{top_b['name']}** contributed a crucial knock of **{top_b['runs']} runs off {top_b['balls']} balls** (SR {top_b['sr']}) including {top_b['fours']} fours and {top_b['sixes']} sixes."
+            )
+        # Add bowler highlight
+        if all_bowlers:
+            top_w = all_bowlers[0]
+            ai_insights.append(
+                f"On the bowling front, **{top_w['name']}** put on a clinical display, returning figures of **{top_w['wickets']}/{top_w['runs']}** from **{top_w['overs']} overs** (Economy {top_w['econ']})."
+            )
+    else:
+        # Match still live or no winner yet
+        ai_insights.append("The match is currently in progress. Performers statistics will finalize upon match completion.")
+        if all_batters:
+            top_b = all_batters[0]
+            ai_insights.append(f"Currently, **{top_b['name']}** is leading the batting charts with {top_b['runs']}({top_b['balls']}).")
+            
+    # 6. Response payload
+    response_data = {
+        "match": match_data,
+        "team_a": team_a,
+        "team_b": team_b,
+        "toss_winner_name": toss_winner_name,
+        "winner_name": winner_name,
+        "innings": innings_summaries,
+        "performers": {
+            "batting": all_batters[:5],
+            "bowling": all_bowlers[:5]
+        },
+        "phase_runs": {
+            "1": phase_runs[1],
+            "2": phase_runs[2]
+        },
+        "ai_insights": "\n\n".join(ai_insights)
+    }
+    
+    return APIResponse(message="Match summary fetched successfully", data=response_data)
 
 
 # ─── WebSocket (Live Score) ───────────────────────────────────────────────────
