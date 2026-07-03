@@ -192,6 +192,55 @@ async def list_matches(status: str | None = None, limit: int = 20):
     return APIResponse(message="Matches fetched", data=response.data)
 
 
+@router.get("/completed", response_model=APIResponse)
+async def get_recent_completed_matches(limit: int = 3):
+    """Get recent completed matches with their innings scores for the home dashboard."""
+    matches_res = (
+        supabase.table("matches")
+        .select("*, team_a:team_a_id(name, avatar_color), team_b:team_b_id(name, avatar_color)")
+        .eq("status", "completed")
+        .order("completed_at", desc=True)
+        .limit(10)
+        .execute()
+    )
+    completed = matches_res.data or []
+    
+    results = []
+    for m in completed:
+        match_id = m["id"]
+        inn_res = (
+            supabase.table("innings")
+            .select("innings_number, batting_team_id, total_runs, total_wickets, overs_played")
+            .eq("match_id", match_id)
+            .execute()
+        )
+        innings = inn_res.data or []
+        
+        # Skip dummy completed matches that have no innings data
+        if not innings:
+            continue
+            
+        scores = {}
+        for inn in innings:
+            bat_id = inn["batting_team_id"]
+            overs = float(inn["overs_played"]) if inn["overs_played"] else 0.0
+            scores[bat_id] = {
+                "runs": inn["total_runs"],
+                "wickets": inn["total_wickets"],
+                "overs": overs
+            }
+            
+        results.append({
+            "match": m,
+            "scores": scores
+        })
+        
+        if len(results) >= limit:
+            break
+        
+    return APIResponse(message="Recent battles fetched successfully", data=results)
+
+
 @router.get("/live", response_model=APIResponse)
 async def get_live_matches():
     """Get all live matches for the homepage."""
