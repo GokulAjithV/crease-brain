@@ -652,6 +652,7 @@ async def record_delivery(innings_id: str, ball: DeliveryCreate, user: dict = De
     # Check for innings completion
     is_innings_completed = False
     is_match_completed = False
+    inn1_runs = 0
     
     # Get batting squad size
     batting_team_id = innings["batting_team_id"]
