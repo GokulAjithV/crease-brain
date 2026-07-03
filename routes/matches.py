@@ -7,6 +7,8 @@ scorecard retrieval, and live WebSocket updates.
 
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from typing import List, cast
+from pydantic import BaseModel
+from ai.summary import generate_ai_analysis
 
 from models.schemas import (
     MatchCreate,
@@ -178,7 +180,12 @@ async def create_match(match: MatchCreate, user: dict = Depends(get_current_user
 @router.get("/", response_model=APIResponse)
 async def list_matches(status: str | None = None, limit: int = 20):
     """List matches, optionally filtered by status."""
-    query = supabase.table("matches").select("*").order("created_at", desc=True).limit(limit)
+    query = (
+        supabase.table("matches")
+        .select("*, team_a:team_a_id(name, avatar_color), team_b:team_b_id(name, avatar_color)")
+        .order("created_at", desc=True)
+        .limit(limit)
+    )
     if status:
         query = query.eq("status", status)
     response = query.execute()
@@ -522,6 +529,85 @@ async def start_over(innings_id: str, over: OverStart, user: dict = Depends(get_
     if not res.data:
         raise HTTPException(status_code=400, detail="Failed to start over")
     return APIResponse(message="Over started successfully", data=res.data[0])
+
+
+@router.post("/innings/{innings_id}/end", response_model=APIResponse)
+async def end_innings(innings_id: str):
+    """Manually end the current innings and transition the match state (innings_break or completed)."""
+    # 1. Fetch current innings details
+    inn_res = supabase.table("innings").select("*").eq("id", innings_id).single().execute()
+    if not inn_res.data:
+        raise HTTPException(status_code=404, detail="Innings not found")
+        
+    innings = inn_res.data
+    match_id = innings["match_id"]
+    inn_number = innings["innings_number"]
+    
+    # Update innings status to completed
+    supabase.table("innings").update({"status": "completed"}).eq("id", innings_id).execute()
+    
+    if inn_number == 1:
+        # End of Innings 1 -> transition match to innings_break
+        supabase.table("matches").update({"status": "innings_break"}).eq("id", match_id).execute()
+        return APIResponse(message="Innings 1 ended successfully. Match transitioned to Innings Break.", data={"status": "innings_break"})
+        
+    elif inn_number == 2:
+        # End of Innings 2 -> transition match to completed and calculate results
+        from datetime import datetime, timezone
+        completed_at = datetime.now(timezone.utc).isoformat()
+        
+        # Get Innings 1 to compare scores
+        inn1_res = (
+            supabase.table("innings")
+            .select("*")
+            .eq("match_id", match_id)
+            .eq("innings_number", 1)
+            .single()
+            .execute()
+        )
+        inn1_runs = inn1_res.data["total_runs"] if (inn1_res.data and inn1_res.data.get("total_runs")) else 0
+        inn2_runs = innings.get("total_runs") or 0
+        inn2_wickets = innings.get("total_wickets") or 0
+        
+        # Get match details to check match type/max wickets
+        match_res = supabase.table("matches").select("match_type").eq("id", match_id).single().execute()
+        max_wickets = 10
+        if match_res.data:
+            match_type = match_res.data.get("match_type")
+            if match_type in ["100_ball", "tens"]:
+                max_wickets = 5
+                
+        winner_id = None
+        win_type = None
+        win_margin = None
+        
+        if inn2_runs > inn1_runs:
+            # Innings 2 batting team chased down the target
+            winner_id = innings["batting_team_id"]
+            win_type = "wickets"
+            win_margin = max(max_wickets - inn2_wickets, 0)
+        elif inn2_runs < inn1_runs:
+            # Innings 1 batting team defended the score
+            winner_id = innings["bowling_team_id"]
+            win_type = "runs"
+            win_margin = inn1_runs - inn2_runs
+        else:
+            # Tie
+            winner_id = None
+            win_type = None
+            win_margin = 0
+            
+        supabase.table("matches").update({
+            "status": "completed",
+            "winner_id": winner_id,
+            "win_type": win_type,
+            "win_margin": win_margin,
+            "completed_at": completed_at
+        }).eq("id", match_id).execute()
+        
+        return APIResponse(message="Match completed successfully.", data={"status": "completed"})
+        
+    return APIResponse(message="Innings ended.", data={})
 
 
 # ─── Ball-by-Ball ─────────────────────────────────────────────────────────────
@@ -967,6 +1053,17 @@ async def get_match_summary(match_id: str):
     }
     
     return APIResponse(message="Match summary fetched successfully", data=response_data)
+
+
+class MatchAnalysisRequest(BaseModel):
+    question: str
+    history: List[dict] = []
+
+@router.post("/{match_id}/analyze", response_model=APIResponse)
+async def analyze_match(match_id: str, payload: MatchAnalysisRequest):
+    """Analyze match data based on user question and history using Gemini RAG."""
+    answer = await generate_ai_analysis(match_id, payload.question, payload.history)
+    return APIResponse(message="Analysis generated successfully", data={"answer": answer})
 
 
 # ─── WebSocket (Live Score) ───────────────────────────────────────────────────
