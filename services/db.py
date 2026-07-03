@@ -27,6 +27,8 @@ if not _url or not _key:
 @lru_cache(maxsize=1)
 def get_supabase_client() -> Client:
     """Return a cached Supabase client (singleton)."""
+    assert _url is not None
+    assert _key is not None
     return create_client(_url, _key)
 
 
