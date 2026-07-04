@@ -3,6 +3,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, status
 from typing import List
+from pydantic import BaseModel
 from models.schemas import TeamCreate, TeamPlayerAdd, APIResponse
 from services.db import supabase
 from services.auth import get_current_user
@@ -37,21 +38,34 @@ async def create_team(team: TeamCreate, user: dict = Depends(get_current_user)):
     logger.info("Successfully created team %s (ID: %s)", team.name, response.data[0].get("id"))
     return APIResponse(message="Team created successfully", data=response.data[0])
 
+class TeamUpdate(BaseModel):
+    name: str | None = None
+    avatar_color: str | None = None
+    city: str | None = None
+    captain_can_edit: bool | None = None
+    is_active: bool | None = None
+
+
 @router.get("", response_model=APIResponse)
-async def list_teams(scope: str | None = None, user: dict = Depends(get_current_user)):
+async def list_teams(scope: str | None = None, active_only: bool = False, user: dict = Depends(get_current_user)):
     """
     List teams.
 
     Args:
         scope: 'all' to return every team, otherwise only the current user's teams.
+        active_only: if true, returns only active teams.
     """
     user_id = user.get("sub")
-    logger.info("Fetching teams for user %s (scope=%s)", user_id, scope)
+    logger.info("Fetching teams for user %s (scope=%s, active_only=%s)", user_id, scope, active_only)
 
-    if scope == "all":
-        response = supabase.table("teams").select("*, team_players(count)").order("name").execute()
-    else:
-        response = supabase.table("teams").select("*, team_players(count)").eq("created_by", user_id).order("name").execute()
+    query = supabase.table("teams").select("*, team_players(count)")
+    if scope != "all":
+        query = query.eq("created_by", user_id)
+        
+    if active_only:
+        query = query.eq("is_active", True)
+
+    response = query.order("name").execute()
 
     # Flatten the player_count from the nested team_players aggregate
     teams = []
@@ -294,3 +308,74 @@ async def list_team_players(team_id: str, user: dict = Depends(get_current_user)
             "players": players
         }
     )
+
+
+@router.delete("/{team_id}/players/{player_id}", response_model=APIResponse)
+async def remove_player_from_team(team_id: str, player_id: str, user: dict = Depends(get_current_user)):
+    user_id = user.get("sub")
+    logger.info("User %s is removing player %s from team %s", user_id, player_id, team_id)
+    
+    # 1. Fetch team details
+    team_res = supabase.table("teams").select("created_by").eq("id", team_id).execute()
+    if not team_res.data:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Team not found")
+        
+    # Check permissions
+    team_creator = team_res.data[0].get("created_by")
+    if team_creator != user_id and player_id != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to remove this player"
+        )
+        
+    # 2. Delete player from team
+    res = supabase.table("team_players").delete().eq("team_id", team_id).eq("user_id", player_id).execute()
+    if not res.data:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Player not found in this team")
+        
+    logger.info("Successfully removed player %s from team %s", player_id, team_id)
+    return APIResponse(message="Player removed from team successfully", data=res.data[0])
+
+
+@router.put("/{team_id}", response_model=APIResponse)
+async def update_team(team_id: str, team: TeamUpdate, user: dict = Depends(get_current_user)):
+    user_id = user.get("sub")
+    logger.info("User %s is updating team %s", user_id, team_id)
+    
+    # 1. Fetch team details
+    team_res = supabase.table("teams").select("*").eq("id", team_id).execute()
+    if not team_res.data:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Team not found")
+        
+    # Check permissions (must be team creator)
+    if team_res.data[0].get("created_by") != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the team creator can edit team details"
+        )
+        
+    payload = {}
+    if team.name is not None:
+        payload["name"] = team.name
+        # Update initials
+        words = team.name.split()
+        payload["initials"] = "".join([w[0].upper() for w in words[:2]])
+    if team.avatar_color is not None:
+        payload["avatar_color"] = team.avatar_color
+    if team.city is not None:
+        payload["city"] = team.city
+    if team.captain_can_edit is not None:
+        payload["captain_can_edit"] = team.captain_can_edit
+    if team.is_active is not None:
+        payload["is_active"] = team.is_active
+        
+    if not payload:
+        return APIResponse(message="No updates provided", data=team_res.data[0])
+        
+    response = supabase.table("teams").update(payload).eq("id", team_id).execute()
+    if not response.data:
+        raise HTTPException(status_code=500, detail="Failed to update team")
+        
+    logger.info("Successfully updated team %s", team_id)
+    return APIResponse(message="Team updated successfully", data=response.data[0])
+
