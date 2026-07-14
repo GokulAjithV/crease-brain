@@ -180,7 +180,7 @@ async def generate_ai_analysis(match_id: str, question: str, history: list) -> s
         },
         "generationConfig": {
             "temperature": 0.2,
-            "maxOutputTokens": 1000
+            "maxOutputTokens": 2048
         }
     }
     
