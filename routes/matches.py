@@ -890,6 +890,173 @@ async def record_wicket(innings_id: str, ball: DeliveryCreate, user: dict = Depe
     return await record_delivery(innings_id, ball, user)
 
 
+@router.post("/innings/{innings_id}/undo", response_model=APIResponse)
+async def undo_delivery(innings_id: str, user: dict = Depends(get_current_user)):
+    """Undo the last recorded delivery in an innings, supporting crossing over boundaries."""
+    # 1. Fetch innings
+    innings_res = supabase.table("innings").select("*").eq("id", innings_id).single().execute()
+    if not innings_res.data:
+        raise HTTPException(status_code=404, detail="Innings not found")
+    innings = innings_res.data
+    match_id = innings["match_id"]
+
+    # 2. Find the last delivery in this innings
+    last_del_res = (
+        supabase.table("deliveries")
+        .select("*")
+        .eq("innings_id", innings_id)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if not last_del_res.data:
+        # If there are no deliveries at all, check if there is an empty over
+        empty_over_res = (
+            supabase.table("overs")
+            .select("*")
+            .eq("innings_id", innings_id)
+            .execute()
+        )
+        if empty_over_res.data:
+            # Delete any empty overs
+            for o in empty_over_res.data:
+                d_count = supabase.table("deliveries").select("id", count=CountMethod.exact).eq("over_id", o["id"]).execute()
+                if (d_count.count or 0) == 0:
+                    supabase.table("overs").delete().eq("id", o["id"]).execute()
+            # Reset innings overs_played to 0.0
+            supabase.table("innings").update({"overs_played": 0.0, "status": "playing"}).eq("id", innings_id).execute()
+            supabase.table("matches").update({"status": "playing"}).eq("id", match_id).execute()
+            scorecard = await _build_scorecard(match_id)
+            if scorecard:
+                await manager.broadcast(match_id, scorecard)
+            return APIResponse(message="No deliveries to undo. Cleaned up empty overs.", data=scorecard)
+
+        raise HTTPException(status_code=400, detail="No deliveries found to undo")
+
+    last_del = last_del_res.data[0]
+    del_id = last_del["id"]
+    over_id = last_del["over_id"]
+
+    # 3. If there is a newer active over that has 0 deliveries, delete it first
+    # (since the user is undoing a delivery from the previous over, we must discard this new empty over)
+    active_overs_res = (
+        supabase.table("overs")
+        .select("*")
+        .eq("innings_id", innings_id)
+        .eq("is_completed", False)
+        .execute()
+    )
+    for ao in (active_overs_res.data or []):
+        if ao["id"] != over_id:
+            ao_dels = supabase.table("deliveries").select("id", count=CountMethod.exact).eq("over_id", ao["id"]).execute()
+            if (ao_dels.count or 0) == 0:
+                supabase.table("overs").delete().eq("id", ao["id"]).execute()
+
+    # 4. Delete the last delivery
+    supabase.table("deliveries").delete().eq("id", del_id).execute()
+
+    # 5. Recalculate stats for this over
+    over_dels_res = supabase.table("deliveries").select("*").eq("over_id", over_id).execute()
+    over_dels = over_dels_res.data or []
+
+    over_runs = 0
+    over_wickets = 0
+    for od in over_dels:
+        runs_b = od.get("runs_batsman") or 0
+        runs_e = od.get("runs_extras") or 0
+        extra_t = od.get("extra_type")
+        is_w = od.get("is_wicket") or False
+        wicket_t = od.get("wicket_type")
+
+        over_runs += runs_b + (runs_e if extra_t in ["wide", "noball"] else 0)
+        if is_w and wicket_t in ["bowled", "caught", "lbw", "stumped", "hit_wicket"]:
+            over_wickets += 1
+
+    # Mark over as not completed since we just removed a ball from it
+    supabase.table("overs").update({
+        "runs": over_runs,
+        "wickets": over_wickets,
+        "is_completed": False
+    }).eq("id", over_id).execute()
+
+    # 6. Recalculate innings totals from all remaining deliveries
+    inn_dels_res = supabase.table("deliveries").select("*").eq("innings_id", innings_id).execute()
+    inn_dels = inn_dels_res.data or []
+
+    total_runs = 0
+    total_wickets = 0
+    extras_wide = 0
+    extras_noball = 0
+    extras_bye = 0
+    extras_legbye = 0
+
+    # Count completed overs
+    completed_overs_count_res = (
+        supabase.table("overs")
+        .select("id", count=CountMethod.exact)
+        .eq("innings_id", innings_id)
+        .eq("is_completed", True)
+        .execute()
+    )
+    completed_overs_count = completed_overs_count_res.count or 0
+
+    # Legal balls in the active (uncompleted) over
+    legal_balls_in_active_over = 0
+    for od in over_dels:
+        if od.get("extra_type") not in ["wide", "noball"]:
+            legal_balls_in_active_over += 1
+
+    overs_played = completed_overs_count + (legal_balls_in_active_over / 10.0)
+
+    for d in inn_dels:
+        runs_b = d.get("runs_batsman") or 0
+        runs_e = d.get("runs_extras") or 0
+        extra_t = d.get("extra_type")
+        is_w = d.get("is_wicket") or False
+
+        total_runs += runs_b + runs_e
+        if is_w:
+            total_wickets += 1
+
+        if extra_t == "wide":
+            extras_wide += runs_e
+        elif extra_t == "noball":
+            extras_noball += runs_e
+        elif extra_t == "bye":
+            extras_bye += runs_e
+        elif extra_t == "legbye":
+            extras_legbye += runs_e
+
+    # Update innings table
+    # Reset status back to 'playing' if it was completed
+    supabase.table("innings").update({
+        "total_runs": total_runs,
+        "total_wickets": total_wickets,
+        "overs_played": overs_played,
+        "extras_wide": extras_wide,
+        "extras_noball": extras_noball,
+        "extras_bye": extras_bye,
+        "extras_legbye": extras_legbye,
+        "status": "playing"
+    }).eq("id", innings_id).execute()
+
+    # 7. Update match status back to playing (if it was completed/innings_break)
+    supabase.table("matches").update({
+        "status": "playing",
+        "winner_id": None,
+        "win_type": None,
+        "win_margin": None,
+        "completed_at": None
+    }).eq("id", match_id).execute()
+
+    # 8. Rebuild scorecard and broadcast
+    scorecard = await _build_scorecard(match_id)
+    if scorecard:
+        await manager.broadcast(match_id, scorecard)
+
+    return APIResponse(message="Last delivery undone successfully", data=scorecard)
+
+
 # ─── Scorecard ────────────────────────────────────────────────────────────────
 
 @router.get("/{match_id}/scorecard")
