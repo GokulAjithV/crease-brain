@@ -15,6 +15,8 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 
+from services.opensearch_logger import setup_opensearch_logging
+
 from routes.matches import router as matches_router
 from routes.players import router as players_router
 from routes.chat import router as chat_router
@@ -29,6 +31,9 @@ app = FastAPI(
     description="Backend API for CREASE — grassroots cricket scoring with AI insights.",
     version="0.1.0",
 )
+
+# Initialise OpenSearch log handler and HTTP telemetry middleware
+setup_opensearch_logging(app)
 
 # ─── CORS ─────────────────────────────────────────────────────────────────────
 # Allow the crease-lens Vercel frontend (and localhost for dev)
