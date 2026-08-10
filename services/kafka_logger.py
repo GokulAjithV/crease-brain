@@ -32,14 +32,21 @@ KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "crease-logs")
 KAFKA_ENABLED = os.getenv("KAFKA_ENABLED", "false").lower() in ("true", "1", "yes")
 
 _producer = None
+_last_producer_error_time = 0
+PRODUCER_RETRY_INTERVAL_SEC = 60
 
 def _get_kafka_producer():
-    """Initialise Kafka producer lazily."""
-    global _producer
+    """Initialise Kafka producer lazily with a circuit breaker."""
+    global _producer, _last_producer_error_time
     if _producer is not None:
         return _producer
 
     if not KAFKA_ENABLED:
+        return None
+
+    now = time.time()
+    # Circuit breaker: don't attempt to reconnect on every single log if Kafka is down
+    if now - _last_producer_error_time < PRODUCER_RETRY_INTERVAL_SEC:
         return None
 
     try:
@@ -47,13 +54,19 @@ def _get_kafka_producer():
         _producer = KafkaProducer(
             bootstrap_servers=[KAFKA_BOOTSTRAP_SERVERS],
             value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-            retries=3,
-            acks=1
+            retries=1,
+            acks=1,
+            max_block_ms=2000, # Do not block API requests for more than 2s if Kafka is unreachable
+            request_timeout_ms=2000,
+            api_version_auto_timeout_ms=2000
         )
-        logger.info(f"Initialized KafkaProducer for {KAFKA_BOOTSTRAP_SERVERS}")
+        # Use standard print to avoid infinite logging loops in the logging handler itself
+        print(f"Initialized KafkaProducer for {KAFKA_BOOTSTRAP_SERVERS}")
         return _producer
     except Exception as e:
-        logger.error("Failed to initialize Kafka producer: %s", e)
+        _last_producer_error_time = time.time()
+        import sys
+        print(f"Failed to initialize Kafka producer (will retry in 60s): {e}", file=sys.stderr)
         return None
 
 
@@ -111,8 +124,11 @@ class KafkaLogHandler(logging.Handler):
 
             producer = _get_kafka_producer()
             if producer:
+                # OpenSearch Pull-based ingestion requires the document to be wrapped in a _source field
+                payload = {"_source": doc}
+                
                 # The KafkaProducer in python is already asynchronous (it queues internally)
-                producer.send(KAFKA_TOPIC, doc)
+                producer.send(KAFKA_TOPIC, payload)
         except Exception as e:
             self.handleError(record)
 
