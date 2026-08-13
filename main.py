@@ -6,6 +6,9 @@ and registers all route modules.
 """
 
 import logging
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -15,7 +18,7 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 
-from services.opensearch_logger import setup_opensearch_logging
+from services.kafka_logger import setup_kafka_logging
 
 from routes.matches import router as matches_router
 from routes.players import router as players_router
@@ -32,8 +35,8 @@ app = FastAPI(
     version="0.1.0",
 )
 
-# Initialise OpenSearch log handler and HTTP telemetry middleware
-setup_opensearch_logging(app)
+# Initialise Kafka log handler and HTTP telemetry middleware
+setup_kafka_logging(app)
 
 # ─── CORS ─────────────────────────────────────────────────────────────────────
 # Allow the crease-lens Vercel frontend (and localhost for dev)

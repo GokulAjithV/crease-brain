@@ -38,7 +38,14 @@ async def register(user: UserRegister):
     if user.phone:
         query = query.or_(f"phone.eq.{user.phone}")
         
-    existing_user = query.execute()
+    try:
+        existing_user = query.execute()
+    except Exception as e:
+        logger.error(f"Supabase query failed during registration check for {identifier}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Authentication service is currently unavailable. Please try again later."
+        )
     if existing_user.data:
         logger.warning("Registration failed: user with email/phone %s already exists.", identifier)
         raise HTTPException(
@@ -64,7 +71,14 @@ async def register(user: UserRegister):
         payload["phone"] = user.phone
 
     # Insert into Supabase
-    response = supabase.table("users").insert(payload).execute()
+    try:
+        response = supabase.table("users").insert(payload).execute()
+    except Exception as e:
+        logger.error(f"Supabase query failed during registration insert for {identifier}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Authentication service is currently unavailable. Please try again later."
+        )
     
     if not response.data:
         logger.error("Database insert failed during registration for %s", identifier)
@@ -94,7 +108,14 @@ async def login(credentials: UserLogin):
     logger.info("Login attempt for: %s", credentials.email_or_phone)
     # Find user by email or phone
     # We will try both fields.
-    query = supabase.table("users").select("*").or_(f"email.eq.{credentials.email_or_phone},phone.eq.{credentials.email_or_phone}").limit(1).execute()
+    try:
+        query = supabase.table("users").select("*").or_(f"email.eq.{credentials.email_or_phone},phone.eq.{credentials.email_or_phone}").limit(1).execute()
+    except Exception as e:
+        logger.error(f"Supabase query failed during login for {credentials.email_or_phone}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Authentication service is currently unavailable. Please try again later."
+        )
     
     if not query.data:
         logger.warning("Login failed: User not found for %s", credentials.email_or_phone)
@@ -170,7 +191,14 @@ async def google_login(payload: GoogleLoginRequest):
     last_name = google_data.get("family_name", "").strip()
     
     # 2. Check if user already exists by email
-    query = supabase.table("users").select("*").eq("email", email).limit(1).execute()
+    try:
+        query = supabase.table("users").select("*").eq("email", email).limit(1).execute()
+    except Exception as e:
+        logger.error(f"Supabase query failed during Google login check for {email}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Authentication service is currently unavailable. Please try again later."
+        )
     
     if query.data:
         # User exists, proceed with login
@@ -200,7 +228,14 @@ async def google_login(payload: GoogleLoginRequest):
             "is_active": True
         }
         
-        insert_res = supabase.table("users").insert(reg_payload).execute()
+        try:
+            insert_res = supabase.table("users").insert(reg_payload).execute()
+        except Exception as e:
+            logger.error(f"Supabase query failed during Google SSO registration for {email}: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Authentication service is currently unavailable. Please try again later."
+            )
         if not insert_res.data:
             logger.error("Failed to insert new Google SSO user in database")
             raise HTTPException(
