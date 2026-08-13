@@ -21,6 +21,10 @@ from starlette.requests import Request
 from starlette.responses import Response
 import uuid
 
+# Suppress kafka-python's internal infinite reconnect logging spam
+logging.getLogger("kafka").setLevel(logging.CRITICAL)
+logging.getLogger("aiokafka").setLevel(logging.CRITICAL)
+
 logger = logging.getLogger(__name__)
 
 # Context variable for trace ID
