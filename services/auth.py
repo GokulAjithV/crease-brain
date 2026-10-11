@@ -12,7 +12,7 @@ from fastapi.security import OAuth2PasswordBearer
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
 # JWT configuration
-JWT_SECRET = os.getenv("JWT_SECRET", "super-secret-key-change-in-production")
+JWT_SECRET = os.getenv("JWT_SECRET_KEY", "super-secret-key-change-in-production")
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_DAYS = 7
 
