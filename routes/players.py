@@ -5,9 +5,14 @@ Handles player CRUD, profile retrieval, per-player career stats,
 and match history lookups.
 """
 
+from email import message
+from pydantic.deprecated.copy_internals import _get_value
+from fastapi.openapi.utils import status_code_ranges
 import logging
-from fastapi import APIRouter, HTTPException, Depends
+import uuid
+from fastapi import APIRouter, HTTPException, Depends, UploadFile, File
 from typing import cast
+from botocore.exceptions import ClientError
 
 from models.schemas import (
     PlayerCreate,
@@ -18,6 +23,8 @@ from models.schemas import (
 )
 from services.db import supabase
 from services.auth import get_current_user
+from services.storage import upload_file, delete_file, key_from_url
+from services.image_processing import process_avatar, InvalidImageError
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +89,83 @@ async def search_by_phone(phone: str, user: dict = Depends(get_current_user)):
         return APIResponse(message="No player found with this phone number", data=None)
         
     return APIResponse(message="Player found", data=query.data[0])
+
+
+MAX_AVATAR_BYTES = 5 * 1024 * 1024
+ALLOWED_AVATAR_TYPES = {"image/jpeg", "image/png", "image/webp"}
+
+def _delete_quietly(key: str) -> None:
+    """best-effort s3 delete; a leftover file must never fail the request"""
+    try:
+        delete_file(key)
+    except ClientError:
+        logger.warning("Failed to delete s3 object %s", key, exc_info=True)
+
+def _get_avatar_url(user_id: str) -> str | None:
+    res = supabase.table("users").select("avatar_url").eq("id", user_id).limit(1).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="User not found")
+    row = cast(dict, res.data[0])
+    return row.get("avatar_url")
+
+# plain `def` (not async): Pillow, boto3 and supabase are blocking, so FastAPI
+# runs this in a worker thread instead of freezing the event loop.
+
+@router.post("/me/avatar", response_model=APIResponse)
+def upload_my_avatar(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
+    """upload or replace the current user's profile photo"""
+    user_id = user["sub"]
+
+    # cheap early rejection; the real check is Pillow below (content_type can be faked)
+    if file.content_type not in ALLOWED_AVATAR_TYPES:
+        raise HTTPException(status_code=415, detail="Only JPEG, PNG or WebP images are allowed.")
+
+    #Read one byte past the limit to detect oversize without loading huge files
+    data = file.file.read(MAX_AVATAR_BYTES + 1)
+    if len(data) > MAX_AVATAR_BYTES:
+        raise HTTPException(status_code=413, detail="Image must be 5MB or smaller")
+
+    try:
+        webp = process_avatar(data)
+    except InvalidImageError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    old_url = _get_avatar_url(user_id)
+    key = f"avatars/{user_id}/{uuid.uuid4().hex}.webp"
+    
+    try:
+        new_url = upload_file(key, webp, "image/webp")
+    except ClientError:
+        logger.exception("S3 upload failed for user %s", user_id)
+        raise HTTPException(status_code=502, detail="Could not store image. Please try again.")
+    
+    try: supabase.table("users").update({"avatar_url": new_url}).eq("id", user_id).execute()
+    except Exception:
+        logger.exception("DB update failed after avatar upload for user %s", user_id)
+        _delete_quietly(key) # don't leave an orphaned file behind in s3
+        raise HTTPException(status_code=500, detail="Could not save profile photo")
+
+    old_key = key_from_url(old_url)
+    if old_key:
+        _delete_quietly(old_key)
+    
+    logger.info("Avatar updated for user %s", user_id)
+    return APIResponse(message="Avatar updated", data={"avatar_url": new_url})
+
+
+@router.delete("/me/avatar", response_model=APIResponse)
+def delete_my_avatar(user: dict = Depends(get_current_user)):
+    """Remove the current user's profile photo (falls back to initials)"""
+    user_id = user["sub"]
+    old_url = _get_avatar_url(user_id)
+    
+    supabase.table("users").update({"avatar_url": None}).eq("id", user_id).execute()
+
+    old_key = key_from_url(old_url)
+    if old_key:
+        _delete_quietly(old_key)
+    return APIResponse(message="Avatar removed", data={"avatar_url": None})
+
 
 
 @router.get("/{player_id}", response_model=APIResponse)

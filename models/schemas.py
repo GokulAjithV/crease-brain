@@ -104,6 +104,7 @@ class AuthUserResponse(BaseModel):
     email: Optional[str] = None
     phone: Optional[str] = None
     avatar_color: Optional[str] = None
+    avatar_url: Optional[str] = None
     role: str
 
 class Token(BaseModel):
@@ -129,7 +130,6 @@ class PlayerCreate(BaseModel):
 class PlayerUpdate(BaseModel):
     """Partial update for a player profile."""
     name: Optional[str] = Field(None, min_length=1, max_length=100)
-    avatar_url: Optional[str] = None
     role: Optional[PlayerRole] = None
     batting_style: Optional[BattingStyle] = None
     bowling_style: Optional[BowlingStyle] = None
