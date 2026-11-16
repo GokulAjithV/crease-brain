@@ -150,3 +150,7 @@ Open `http://localhost:8000/docs` to try the API.
 
 ## Up Next
 1. Replacing `opensearch` with `grafana cloud` for log management and analytics 
+
+## Author
+
+**Gokul Ajith V** · [LinkedIn](https://linkedin.com/in/gokulajithv) · [GitHub](https://github.com/GokulAjithV)
