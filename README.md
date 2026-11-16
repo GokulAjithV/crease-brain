@@ -147,3 +147,10 @@ Open `http://localhost:8000/docs` to try the API.
 ## Related
 
 - **[Sentri](https://github.com/GokulAjithV/sentri)**: the log triage and root-cause analysis platform that receives CREASE's logs over Kafka.
+
+## Up Next
+1. Replacing `opensearch` with `grafana cloud` for log management and analytics 
+
+## Author
+
+**Gokul Ajith V** · [LinkedIn](https://linkedin.com/in/gokulajithv) · [GitHub](https://github.com/GokulAjithV)
